@@ -1,0 +1,332 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    // App / image
+    APP_NAME      = "myapp"
+    IMAGE_REPO    = "laly9999/myapp"
+    IMAGE_TAG     = "${BUILD_NUMBER}"
+    FULL_IMAGE    = "${IMAGE_REPO}:${IMAGE_TAG}"
+
+    // Sonar
+    SONAR_SERVER  = "MySonar"
+    SONAR_PROJECT = "myapp"
+
+    // GitOps
+    GITOPS_MANIFEST = "gitops/myapp/deployment.yaml"
+    ARGOCD_PASS     = credentials('argocd-pass')
+    ARGOCD_SERVER = "192.168.49.2:32712"
+    ARGOCD_APP    = "myapp-devsecops"
+
+    // Gates
+    MAX_TRIVY_CRITICAL = "0"
+    MAX_TRIVY_HIGH     = "0"
+
+    // Dependency-Check gate: "7" => fail if CVSS >= 7; empty => report-only
+    FAIL_ON_CVSS = ""
+
+    // NVD tuning (helps avoid 429)
+    NVD_API_DELAY_MS     = "6000"
+    NVD_MAX_RETRY_COUNT  = "30"
+    NVD_VALID_FOR_HOURS  = "24"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        git branch: 'main', url: 'https://github.com/lily4499/devsecops-cicd-pipeline.git'
+      }
+    }
+
+    stage("Prepare Reports Folders") {
+      steps {
+        sh '''
+          set -e
+          mkdir -p reports/sonar reports/dependency-check reports/trivy reports/meta .dc-data
+
+          # placeholders so archive always shows folders
+          echo "placeholder" > reports/sonar/.keep
+          echo "placeholder" > reports/dependency-check/.keep
+          echo "placeholder" > reports/trivy/.keep
+
+          {
+            echo "job=$JOB_NAME"
+            echo "build=$BUILD_NUMBER"
+            echo "url=$BUILD_URL"
+            echo "commit=$(git rev-parse --short HEAD 2>/dev/null || true)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > reports/meta/build-info.txt
+        '''
+      }
+    }
+
+    stage("Install + Unit Tests") {
+        steps {
+            dir("app") {
+            sh '''
+                set -e
+                if [ -f package-lock.json ]; then
+                echo "Trying npm ci..."
+                npm ci || {
+                    echo "npm ci failed (lockfile mismatch). Falling back to npm install..."
+                    npm install
+                }
+                else
+                echo "No lockfile found. Running npm install..."
+                npm install
+                fi
+
+                npm test
+            '''
+            }
+        }
+    }
+
+
+    stage("SonarQube Scan") {
+      steps {
+        script {
+          def scannerHome = tool 'SonarScanner'
+          withSonarQubeEnv("${SONAR_SERVER}") {
+            sh """
+              set -e
+              mkdir -p reports/sonar
+              ${scannerHome}/bin/sonar-scanner \
+                -Dsonar.projectKey=${SONAR_PROJECT} \
+                -Dsonar.projectName=${SONAR_PROJECT} \
+                -Dproject.settings=sonar-project.properties \
+              2>&1 | tee reports/sonar/sonar-scanner.log
+            """
+          }
+        }
+      }
+    }
+
+    stage("Quality Gate") {
+      steps {
+        script {
+          timeout(time: 6, unit: 'MINUTES') {
+            def qg = waitForQualityGate()
+            writeFile file: 'reports/sonar/quality-gate.txt',  text: "status=${qg.status}\n"
+            writeFile file: 'reports/sonar/quality-gate.json', text: "{\"status\":\"${qg.status}\"}\n"
+
+            echo "Sonar Quality Gate: ${qg.status}"
+            if (qg.status != 'OK') {
+              error "Quality Gate failed: ${qg.status}"
+            }
+          }
+        }
+      }
+    }
+
+    stage("Dependency-Check (SCA)") {
+        options { timeout(time: 35, unit: 'MINUTES') }
+        steps {
+            withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+            sh '''
+                set -e
+
+                mkdir -p reports/dependency-check .dc-data
+
+                DC_IMAGE="owasp/dependency-check:latest"
+                DATA_DIR="$(pwd)/.dc-data"
+                REPORT_DIR="$(pwd)/reports/dependency-check"
+
+                # Run container as the Jenkins user so permissions match
+                RUN_AS="--user $(id -u):$(id -g)"
+
+                # If cache DB exists, avoid re-downloading NVD every build
+                UPDATE_FLAG=""
+                if [ -f "$DATA_DIR/odc.mv.db" ]; then
+                echo "Cache DB found -> using --noupdate"
+                UPDATE_FLAG="--noupdate"
+                else
+                echo "No cache DB yet -> first run will download NVD data"
+                fi
+
+                FAIL_ARG=""
+                if [ -n "$FAIL_ON_CVSS" ]; then
+                echo "Gate enabled: failOnCVSS=$FAIL_ON_CVSS"
+                FAIL_ARG="--failOnCVSS $FAIL_ON_CVSS"
+                else
+                echo "Gate disabled (report-only)"
+                fi
+
+                set +e
+                docker run --rm $RUN_AS \
+                -v "$(pwd)/app":/src \
+                -v "$REPORT_DIR":/report \
+                -v "$DATA_DIR":/usr/share/dependency-check/data \
+                "$DC_IMAGE" \
+                --project "${APP_NAME}" \
+                --scan /src \
+                --format "ALL" \
+                --prettyPrint \
+                --out /report \
+                --nvdApiKey "$NVD_API_KEY" \
+                --nvdApiDelay "$NVD_API_DELAY_MS" \
+                --nvdMaxRetryCount "$NVD_MAX_RETRY_COUNT" \
+                --nvdValidForHours "$NVD_VALID_FOR_HOURS" \
+                $UPDATE_FLAG \
+                $FAIL_ARG \
+                2>&1 | tee reports/dependency-check/dependency-check.log
+                EXIT_CODE=${PIPESTATUS:-$?}
+                set -e
+
+                if ! ls reports/dependency-check/dependency-check-report.* >/dev/null 2>&1; then
+                echo "NO REPORT GENERATED. Check dependency-check.log" > reports/dependency-check/NO_REPORT.txt
+                tail -n 60 reports/dependency-check/dependency-check.log >> reports/dependency-check/NO_REPORT.txt || true
+                exit 2
+                fi
+
+                if [ "$EXIT_CODE" -ne 0 ]; then
+                echo "Dependency-Check exited with code: $EXIT_CODE"
+                exit "$EXIT_CODE"
+                fi
+
+                echo "Dependency-Check reports generated:"
+                ls -la reports/dependency-check || true
+            '''
+            }
+        }
+    }
+
+    stage("Build Docker Image") {
+      steps {
+        sh '''
+          set -e
+          docker build -t "${FULL_IMAGE}" app
+        '''
+      }
+    }
+
+    stage("Trivy Image Scan (Gate)") {
+      steps {
+        sh '''
+          set -e
+          mkdir -p reports/trivy
+
+          trivy image --severity CRITICAL,HIGH --format table "${FULL_IMAGE}" | tee reports/trivy/trivy.txt
+          trivy image --severity CRITICAL,HIGH --format json  "${FULL_IMAGE}" > reports/trivy/trivy.json
+          trivy image --severity CRITICAL,HIGH --format sarif -o reports/trivy/trivy.sarif "${FULL_IMAGE}" || true
+
+          CRIT_COUNT=$(grep -o '"Severity":"CRITICAL"' reports/trivy/trivy.json | wc -l | tr -d ' ')
+          HIGH_COUNT=$(grep -o '"Severity":"HIGH"'     reports/trivy/trivy.json | wc -l | tr -d ' ')
+
+          echo "Trivy Gate Results:"
+          echo "  CRITICAL found: $CRIT_COUNT (max allowed: ${MAX_TRIVY_CRITICAL})"
+          echo "  HIGH found:     $HIGH_COUNT (max allowed: ${MAX_TRIVY_HIGH})"
+
+          if [ "$CRIT_COUNT" -gt "${MAX_TRIVY_CRITICAL}" ]; then
+            echo "FAIL: CRITICAL vulnerabilities exceed threshold."
+            exit 1
+          fi
+
+          if [ "$HIGH_COUNT" -gt "${MAX_TRIVY_HIGH}" ]; then
+            echo "FAIL: HIGH vulnerabilities exceed threshold."
+            exit 1
+          fi
+
+          echo "PASS: Trivy gate passed."
+        '''
+      }
+    }
+
+    stage("Push Image") {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          sh '''
+            set -e
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push "${FULL_IMAGE}"
+          '''
+        }
+      }
+    }
+
+    stage("Update GitOps Manifest") {
+      steps {
+        sh '''
+          set -e
+          if [ ! -f "${GITOPS_MANIFEST}" ]; then
+            echo "ERROR: GitOps manifest not found: ${GITOPS_MANIFEST}"
+            exit 2
+          fi
+
+          sed -i "s|^\\(\\s*image:\\s*\\).*|\\1${FULL_IMAGE}|g" "${GITOPS_MANIFEST}"
+          echo "Updated manifest image:"
+          grep -n "image:" "${GITOPS_MANIFEST}" || true
+        '''
+      }
+    }
+
+    stage("Commit GitOps Update") {
+      steps {
+        withCredentials([string(credentialsId: 'github-pat', variable: 'GITHUB_TOKEN')]) {
+          sh '''
+            set -e
+            git config user.email "konissili@gmail.com"
+            git config user.name  "lily4499"
+
+            git add "${GITOPS_MANIFEST}" || true
+            git commit -m "chore(gitops): deploy ${FULL_IMAGE}" || echo "No changes to commit."
+            git push https://x-access-token:${GITHUB_TOKEN}@github.com/lily4499/devsecops-cicd-pipeline.git HEAD:main
+          '''
+        }
+      }
+    }
+
+    stage("Deploy (Argo CD)") {
+      steps {
+        sh '''
+          echo "Argo CD will deploy the new image after GitOps updates."
+          echo "If auto-sync is enabled, no manual action is needed."
+        '''
+      }
+    }
+
+    stage("ArgoCD Sync") {
+        steps {
+            sh '''
+            set -e
+            argocd version --client
+
+            argocd login "$ARGOCD_SERVER" \
+                --username admin \
+                --password "$ARGOCD_PASS" \
+                --insecure
+
+            argocd app sync "$ARGOCD_APP"
+            argocd app wait "$ARGOCD_APP" --health
+            '''
+        }
+    }
+
+
+    stage("Reports Summary") {
+      steps {
+        sh '''
+          set -e
+          echo "==== REPORTS TREE ===="
+          find reports -maxdepth 4 -type f -print | sort | tee reports/meta/reports-tree.txt
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: "reports/**/*", allowEmptyArchive: true
+    }
+  }
+}
+
+
+
+

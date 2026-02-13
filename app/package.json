@@ -1,0 +1,13 @@
+{
+  "name": "myapp-devsecops-demo",
+  "version": "1.0.0",
+  "description": "Simple API for DevSecOps CI/CD pipeline demo (health endpoint).",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node tests/health.test.js"
+  },
+  "dependencies": {
+    "express": "4.18.2"
+  }
+}
