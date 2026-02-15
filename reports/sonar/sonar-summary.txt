@@ -1,0 +1,20 @@
+(sonarqube scan summary can be saved here)
+
+SONARQUBE SUMMARY
+=================
+Project Key: myapp
+Jenkins Job: devsecops-cicd-pipeline
+Build #: 26
+Build URL: http://localhost:9999/job/devsecops-cicd-pipeline/26/
+
+Quality Gate Status: OK
+
+What this means:
+- OK = passed SonarQube quality/security rules
+- ERROR/FAILED = did not meet the rules (fix issues then re-run)
+
+Artifacts:
+- reports/sonar/sonar-scanner.log   (scanner output)
+- reports/sonar/report-task.txt     (task + dashboard URL if available)
+- reports/sonar/quality-gate.txt
+- reports/sonar/quality-gate.json

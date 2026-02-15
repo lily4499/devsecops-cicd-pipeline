@@ -1,0 +1,47 @@
+(trivy output will be saved here)
+
+Image: laly9999/myapp:26
+CRITICAL: 0
+HIGH: 14
+
+[HIGH] CVE-2024-45296 | path-to-regexp 0.1.7 -> 1.9.0, 0.1.10, 8.0.0, 3.3.0, 6.3.0 | Node.js
+  path-to-regexp: Backtracking regular expressions cause ReDoS
+
+[HIGH] CVE-2024-45590 | body-parser 1.20.1 -> 1.20.3 | Node.js
+  body-parser: Denial of Service Vulnerability in body-parser
+
+[HIGH] CVE-2024-52798 | path-to-regexp 0.1.7 -> 0.1.12 | Node.js
+  path-to-regexp: path-to-regexp Unpatched `path-to-regexp` ReDoS in 0.1.x
+
+[HIGH] CVE-2025-15284 | qs 6.11.0 -> 6.14.1 | Node.js
+  qs: qs: Denial of Service via improper input validation in array parsing
+
+[HIGH] CVE-2025-64756 | glob 10.4.5 -> 11.1.0, 10.5.0 | Node.js
+  glob: glob: Command Injection Vulnerability via Malicious Filenames
+
+[HIGH] CVE-2026-23745 | tar 6.2.1 -> 7.5.3 | Node.js
+  node-tar: tar: node-tar: Arbitrary file overwrite and symlink poisoning via unsanitized linkpaths in archives
+
+[HIGH] CVE-2026-23745 | tar 7.4.3 -> 7.5.3 | Node.js
+  node-tar: tar: node-tar: Arbitrary file overwrite and symlink poisoning via unsanitized linkpaths in archives
+
+[HIGH] CVE-2026-23745 | tar 7.4.3 -> 7.5.3 | Node.js
+  node-tar: tar: node-tar: Arbitrary file overwrite and symlink poisoning via unsanitized linkpaths in archives
+
+[HIGH] CVE-2026-23950 | tar 6.2.1 -> 7.5.4 | Node.js
+  node-tar: tar: node-tar: Arbitrary file overwrite via Unicode path collision race condition
+
+[HIGH] CVE-2026-23950 | tar 7.4.3 -> 7.5.4 | Node.js
+  node-tar: tar: node-tar: Arbitrary file overwrite via Unicode path collision race condition
+
+[HIGH] CVE-2026-23950 | tar 7.4.3 -> 7.5.4 | Node.js
+  node-tar: tar: node-tar: Arbitrary file overwrite via Unicode path collision race condition
+
+[HIGH] CVE-2026-24842 | tar 6.2.1 -> 7.5.7 | Node.js
+  node-tar: tar: node-tar: Arbitrary file creation via path traversal bypass in hardlink security check
+
+[HIGH] CVE-2026-24842 | tar 7.4.3 -> 7.5.7 | Node.js
+  node-tar: tar: node-tar: Arbitrary file creation via path traversal bypass in hardlink security check
+
+[HIGH] CVE-2026-24842 | tar 7.4.3 -> 7.5.7 | Node.js
+  node-tar: tar: node-tar: Arbitrary file creation via path traversal bypass in hardlink security check

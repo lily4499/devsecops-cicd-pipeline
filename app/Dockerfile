@@ -1,28 +1,35 @@
-# Option A (recommended): Node 22 LTS on Alpine 3.21
-FROM node:22-alpine3.21
-
-# Option B: Node 24 LTS on Alpine 3.21
-# FROM node:24-alpine3.21
-
+# --------------------
+# 1) Build/deps stage
+# --------------------
+FROM node:22-alpine AS deps
 WORKDIR /app
 
-# Patch OS packages (openssl, etc.)
+# Patch OS packages (openssl etc.) and keep base current
 RUN apk update && apk upgrade --no-cache
 
-# Install only prod deps (repeatable)
-COPY package*.json ./
-RUN npm ci --omit=dev
+# Install prod deps only
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Copy app source only (tests should NOT ship in runtime image)
+# Copy app source
 COPY src ./src
 
-EXPOSE 8080
+# --------------------
+# 2) Runtime stage (NO npm)
+# --------------------
+FROM gcr.io/distroless/nodejs22-debian12:nonroot
+WORKDIR /app
+
+ENV NODE_ENV=production
 ENV PORT=8080
+EXPOSE 8080
 
-# (optional but good): run as non-root (node user exists in official image)
-USER node
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=deps /app/package.json ./package.json
+COPY --from=deps /app/src ./src
 
-CMD ["npm", "start"]
+# Distroless entrypoint is "node"
+CMD ["src/index.js"]
 
 
 

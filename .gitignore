@@ -16,9 +16,9 @@ Thumbs.db
 
 # Reports (keep in repo for portfolio proof, but ignore if you want)
 # If you WANT to commit reports, comment these out.
-reports/**/*.html
-reports/**/*.json
-reports/**/*.txt
+# reports/**/*.html
+# reports/**/*.json
+# reports/**/*.txt
 
 # Logs
 *.log
