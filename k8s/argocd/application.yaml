@@ -1,0 +1,19 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: myapp-devsecops
+  namespace: argocd
+spec:
+  project: default
+  source:
+    # IMPORTANT: update repoURL to YOUR repo
+    repoURL: https://github.com/lily4499/devsecops-cicd-pipeline.git
+    targetRevision: main
+    path: gitops/myapp
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: devsecops-demo
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

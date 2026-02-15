@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: myapp-config
+  namespace: devsecops-demo
+data:
+  APP_MESSAGE: "myapp deployed via DevSecOps pipeline"

@@ -1,0 +1,26 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env
+.env
+.env.*
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Reports (keep in repo for portfolio proof, but ignore if you want)
+# If you WANT to commit reports, comment these out.
+reports/**/*.html
+reports/**/*.json
+reports/**/*.txt
+
+# Logs
+*.log
+
+note.txt

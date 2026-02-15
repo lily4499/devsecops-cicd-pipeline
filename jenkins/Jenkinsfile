@@ -1,0 +1,446 @@
+pipeline {
+  agent any
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    // App / image
+    APP_NAME      = "myapp"
+    IMAGE_REPO    = "laly9999/myapp"
+    IMAGE_TAG     = "${BUILD_NUMBER}"
+    FULL_IMAGE    = "${IMAGE_REPO}:${IMAGE_TAG}"
+
+    // Sonar
+    SONAR_SERVER  = "MySonar"
+    SONAR_PROJECT = "myapp"
+
+    // GitOps
+    GITOPS_MANIFEST = "gitops/myapp/deployment.yaml"
+    ARGOCD_PASS     = credentials('argocd-pass')
+    ARGOCD_SERVER   = "192.168.49.2:32712"
+    ARGOCD_APP      = "myapp-devsecops"
+
+    // Gates
+    MAX_TRIVY_CRITICAL = "0"
+    MAX_TRIVY_HIGH     = "0"
+
+    // Dependency-Check gate: "7" => fail if CVSS >= 7; empty => report-only
+    FAIL_ON_CVSS = ""
+
+    // NVD tuning (helps avoid 429)
+    NVD_API_DELAY_MS     = "6000"
+    NVD_MAX_RETRY_COUNT  = "30"
+    NVD_VALID_FOR_HOURS  = "24"
+
+    // Optional: hide Trivy notice
+    TRIVY_DISABLE_VEX_NOTICE = "true"
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        git branch: 'main', url: 'https://github.com/lily4499/devsecops-cicd-pipeline.git'
+      }
+    }
+
+    stage("Prepare Reports Folders") {
+      steps {
+        sh '''
+          set -e
+          mkdir -p reports/sonar reports/dependency-check reports/trivy reports/meta .dc-data
+
+          echo "placeholder" > reports/sonar/.keep
+          echo "placeholder" > reports/dependency-check/.keep
+          echo "placeholder" > reports/trivy/.keep
+
+          {
+            echo "job=$JOB_NAME"
+            echo "build=$BUILD_NUMBER"
+            echo "url=$BUILD_URL"
+            echo "commit=$(git rev-parse --short HEAD 2>/dev/null || true)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > reports/meta/build-info.txt
+        '''
+      }
+    }
+
+    stage("Install + Unit Tests") {
+      steps {
+        dir("app") {
+          sh '''
+            set -e
+
+            if [ -f package-lock.json ]; then
+              echo "Trying npm ci..."
+              npm ci || {
+                echo "npm ci failed (lockfile mismatch). Falling back to npm install..."
+                npm install
+              }
+            else
+              echo "No lockfile found. Running npm install..."
+              npm install
+            fi
+
+            npm test
+          '''
+        }
+      }
+    }
+
+    stage("SonarQube Scan") {
+      steps {
+        script {
+          def scannerHome = tool 'SonarScanner'
+          withSonarQubeEnv("${SONAR_SERVER}") {
+            sh """
+              set -e
+              mkdir -p reports/sonar
+
+              "${scannerHome}/bin/sonar-scanner" \\
+                -Dsonar.projectKey="${SONAR_PROJECT}" \\
+                -Dsonar.projectName="${SONAR_PROJECT}" \\
+                -Dproject.settings=sonar-project.properties \\
+                > reports/sonar/sonar-scanner.log 2>&1
+
+              # Copy report-task.txt if it exists (contains CE task + dashboard URL)
+              cp -f .scannerwork/report-task.txt reports/sonar/report-task.txt 2>/dev/null || true
+
+              tail -n 120 reports/sonar/sonar-scanner.log || true
+            """
+          }
+        }
+      }
+    }
+
+    stage("Quality Gate") {
+      steps {
+        script {
+          timeout(time: 6, unit: 'MINUTES') {
+            def qg = waitForQualityGate()
+
+            // structured artifacts
+            writeFile file: 'reports/sonar/quality-gate.txt',  text: "status=${qg.status}\n"
+            writeFile file: 'reports/sonar/quality-gate.json', text: "{\"status\":\"${qg.status}\"}\n"
+
+            // COMPLETE readable summary
+            writeFile file: 'reports/sonar/sonar-summary.txt', text: """\
+SONARQUBE SUMMARY
+=================
+Project Key: ${env.SONAR_PROJECT}
+Jenkins Job: ${env.JOB_NAME}
+Build #: ${env.BUILD_NUMBER}
+Build URL: ${env.BUILD_URL}
+
+Quality Gate Status: ${qg.status}
+
+What this means:
+- OK = passed SonarQube quality/security rules
+- ERROR/FAILED = did not meet the rules (fix issues then re-run)
+
+Artifacts:
+- reports/sonar/sonar-scanner.log   (scanner output)
+- reports/sonar/report-task.txt     (task + dashboard URL if available)
+- reports/sonar/quality-gate.txt
+- reports/sonar/quality-gate.json
+""".stripIndent()
+
+            echo "Sonar Quality Gate: ${qg.status}"
+            if (qg.status != 'OK') {
+              error "Quality Gate failed: ${qg.status}"
+            }
+          }
+        }
+      }
+    }
+
+    stage("Dependency-Check (SCA)") {
+      options { timeout(time: 35, unit: 'MINUTES') }
+      steps {
+        withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+          sh '''
+            set -e
+
+            mkdir -p reports/dependency-check .dc-data
+
+            DC_IMAGE="owasp/dependency-check:latest"
+            DATA_DIR="$(pwd)/.dc-data"
+            REPORT_DIR="$(pwd)/reports/dependency-check"
+            RUN_AS="--user $(id -u):$(id -g)"
+
+            UPDATE_FLAG=""
+            if [ -f "$DATA_DIR/odc.mv.db" ]; then
+              echo "Cache DB found -> using --noupdate"
+              UPDATE_FLAG="--noupdate"
+            else
+              echo "No cache DB yet -> first run will download NVD data"
+            fi
+
+            FAIL_ARG=""
+            if [ -n "${FAIL_ON_CVSS:-}" ]; then
+              echo "Gate enabled: failOnCVSS=$FAIL_ON_CVSS"
+              FAIL_ARG="--failOnCVSS $FAIL_ON_CVSS"
+            else
+              echo "Gate disabled (report-only)"
+            fi
+
+            # No "tee" so exit code is correct in /bin/sh
+            set +e
+            docker run --rm $RUN_AS \
+              -v "$(pwd)/app":/src \
+              -v "$REPORT_DIR":/report \
+              -v "$DATA_DIR":/usr/share/dependency-check/data \
+              "$DC_IMAGE" \
+              --project "${APP_NAME}" \
+              --scan /src \
+              --format "ALL" \
+              --prettyPrint \
+              --out /report \
+              --nvdApiKey "$NVD_API_KEY" \
+              --nvdApiDelay "$NVD_API_DELAY_MS" \
+              --nvdMaxRetryCount "$NVD_MAX_RETRY_COUNT" \
+              --nvdValidForHours "$NVD_VALID_FOR_HOURS" \
+              $UPDATE_FLAG \
+              $FAIL_ARG \
+              > reports/dependency-check/dependency-check.log 2>&1
+            EXIT_CODE=$?
+            set -e
+
+            tail -n 160 reports/dependency-check/dependency-check.log || true
+
+            if ! ls reports/dependency-check/dependency-check-report.* >/dev/null 2>&1; then
+              echo "NO REPORT GENERATED. Check dependency-check.log" > reports/dependency-check/NO_REPORT.txt
+              tail -n 220 reports/dependency-check/dependency-check.log >> reports/dependency-check/NO_REPORT.txt || true
+              exit 2
+            fi
+
+            if [ "$EXIT_CODE" -ne 0 ]; then
+              echo "Dependency-Check exited with code: $EXIT_CODE"
+              exit "$EXIT_CODE"
+            fi
+          '''
+        }
+      }
+    }
+
+    stage("Build Docker Image") {
+  steps {
+    sh '''
+      set -e
+      docker build --pull -t "${FULL_IMAGE}" app
+    '''
+  }
+}
+
+
+    stage("Trivy Image Scan (Gate)") {
+      steps {
+        // write python renderer safely
+        sh 'mkdir -p reports/trivy'
+        writeFile file: 'reports/trivy/render_trivy.py', text: '''
+import json, sys
+from pathlib import Path
+
+json_path = Path("reports/trivy/trivy.json")
+txt_path  = Path("reports/trivy/trivy.txt")
+env_path  = Path("reports/trivy/counts.env")
+
+try:
+    raw = json_path.read_text(encoding="utf-8", errors="ignore")
+    data = json.loads(raw)
+except Exception as e:
+    txt_path.write_text(f"ERROR: could not parse trivy.json\\n{e}\\n", encoding="utf-8")
+    env_path.write_text("CRIT_COUNT=0\\nHIGH_COUNT=0\\n", encoding="utf-8")
+    sys.exit(2)
+
+artifact = data.get("ArtifactName") or ""
+results = data.get("Results") or []
+
+vulns = []
+for r in results:
+    target = r.get("Target") or ""
+    for v in (r.get("Vulnerabilities") or []):
+        sev = v.get("Severity")
+        if sev in ("CRITICAL", "HIGH"):
+            vulns.append({
+                "sev": sev,
+                "target": target,
+                "id": v.get("VulnerabilityID") or "",
+                "pkg": v.get("PkgName") or "",
+                "installed": v.get("InstalledVersion") or "",
+                "fixed": v.get("FixedVersion") or "-",
+                "title": (v.get("Title") or "-").strip()
+            })
+
+crit = sum(1 for x in vulns if x["sev"] == "CRITICAL")
+high = sum(1 for x in vulns if x["sev"] == "HIGH")
+
+lines = []
+lines.append(f"Image: {artifact}")
+lines.append(f"CRITICAL: {crit}")
+lines.append(f"HIGH: {high}")
+lines.append("")
+
+if not vulns:
+    lines.append("No HIGH/CRITICAL vulnerabilities found.")
+else:
+    order = {"CRITICAL": 0, "HIGH": 1}
+    vulns.sort(key=lambda x: (order.get(x["sev"], 9), x["id"]))
+    for x in vulns:
+        lines.append(f'[{x["sev"]}] {x["id"]} | {x["pkg"]} {x["installed"]} -> {x["fixed"]} | {x["target"]}')
+        lines.append(f'  {x["title"]}')
+        lines.append("")
+
+txt_path.write_text("\\n".join(lines), encoding="utf-8")
+env_path.write_text(f"CRIT_COUNT={crit}\\nHIGH_COUNT={high}\\n", encoding="utf-8")
+'''.stripIndent()
+
+        sh '''
+          set -e
+          mkdir -p reports/trivy
+
+          trivy image --no-progress --severity CRITICAL,HIGH --format json \
+            -o reports/trivy/trivy.json "${FULL_IMAGE}"
+
+          trivy image --no-progress --severity CRITICAL,HIGH --format sarif \
+            -o reports/trivy/trivy.sarif "${FULL_IMAGE}" || true
+
+          if command -v python3 >/dev/null 2>&1; then
+            python3 reports/trivy/render_trivy.py > reports/trivy/render.out 2>&1 || {
+              echo "Trivy render failed. See reports/trivy/render.out" > reports/trivy/trivy.txt
+              cat reports/trivy/render.out >> reports/trivy/trivy.txt || true
+              exit 2
+            }
+          else
+            CRIT_COUNT=$(grep -o '"Severity":"CRITICAL"' reports/trivy/trivy.json | wc -l | tr -d ' ')
+            HIGH_COUNT=$(grep -o '"Severity":"HIGH"'     reports/trivy/trivy.json | wc -l | tr -d ' ')
+            {
+              echo "Image: ${FULL_IMAGE}"
+              echo "CRITICAL: $CRIT_COUNT"
+              echo "HIGH: $HIGH_COUNT"
+              echo ""
+              echo "python3 not found: open trivy.json for details."
+            } > reports/trivy/trivy.txt
+            echo "CRIT_COUNT=$CRIT_COUNT" > reports/trivy/counts.env
+            echo "HIGH_COUNT=$HIGH_COUNT" >> reports/trivy/counts.env
+          fi
+
+          . reports/trivy/counts.env
+
+          if [ ! -s reports/trivy/trivy.txt ]; then
+            echo "Trivy txt report empty. Check reports/trivy/trivy.json and reports/trivy/render.out" > reports/trivy/trivy.txt
+            exit 2
+          fi
+
+          echo "Trivy Gate Results:"
+          echo "  CRITICAL found: $CRIT_COUNT (max allowed: ${MAX_TRIVY_CRITICAL})"
+          echo "  HIGH found:     $HIGH_COUNT (max allowed: ${MAX_TRIVY_HIGH})"
+
+          if [ "$CRIT_COUNT" -gt "${MAX_TRIVY_CRITICAL}" ]; then
+            echo "FAIL: CRITICAL vulnerabilities exceed threshold."
+            exit 1
+          fi
+
+          if [ "$HIGH_COUNT" -gt "${MAX_TRIVY_HIGH}" ]; then
+            echo "FAIL: HIGH vulnerabilities exceed threshold."
+            exit 1
+          fi
+
+          echo "PASS: Trivy gate passed."
+        '''
+      }
+    }
+
+    stage("Push Image") {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          sh '''
+            set -e
+            echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+            docker push "${FULL_IMAGE}"
+          '''
+        }
+      }
+    }
+
+    stage("Update GitOps Manifest") {
+      steps {
+        sh '''
+          set -e
+          if [ ! -f "${GITOPS_MANIFEST}" ]; then
+            echo "ERROR: GitOps manifest not found: ${GITOPS_MANIFEST}"
+            exit 2
+          fi
+
+          sed -i "s|^\\(\\s*image:\\s*\\).*|\\1${FULL_IMAGE}|g" "${GITOPS_MANIFEST}"
+          echo "Updated manifest image:"
+          grep -n "image:" "${GITOPS_MANIFEST}" || true
+        '''
+      }
+    }
+
+    stage("Commit GitOps Update") {
+      steps {
+        withCredentials([string(credentialsId: 'github-pat', variable: 'GITHUB_TOKEN')]) {
+          sh '''
+            set -e
+            git config user.email "konissili@gmail.com"
+            git config user.name  "lily4499"
+
+            git add "${GITOPS_MANIFEST}" || true
+            git commit -m "chore(gitops): deploy ${FULL_IMAGE}" || echo "No changes to commit."
+            git push https://x-access-token:${GITHUB_TOKEN}@github.com/lily4499/devsecops-cicd-pipeline.git HEAD:main
+          '''
+        }
+      }
+    }
+
+    stage("Deploy (Argo CD)") {
+      steps {
+        sh '''
+          set -e
+          echo "Argo CD will deploy the new image after GitOps updates."
+          echo "If auto-sync is enabled, no manual action is needed."
+        '''
+      }
+    }
+
+    /*
+    stage("ArgoCD Sync") {
+      steps {
+        sh '''
+          set -e
+          argocd version --client
+
+          argocd login "$ARGOCD_SERVER" \
+            --username admin \
+            --password "$ARGOCD_PASS" \
+            --insecure
+
+          argocd app sync "$ARGOCD_APP"
+          argocd app wait "$ARGOCD_APP" --health
+        '''
+      }
+    }
+    */
+
+    stage("Reports Summary") {
+      steps {
+        sh '''
+          set -e
+          echo "==== REPORTS TREE ===="
+          find reports -maxdepth 4 -type f -print | sort | tee reports/meta/reports-tree.txt
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: "reports/**/*", allowEmptyArchive: true
+    }
+  }
+}
