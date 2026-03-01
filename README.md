@@ -1,583 +1,407 @@
 
-# DevSecOps CI/CD Pipeline (Jenkins  → SonarQube + Dependency-Check + Trivy → Security Gates → GitOps Deploy)
+# DevSecOps CI/CD Pipeline
 
-This project is my **DevSecOps CI/CD pipeline** built for a real ops workflow:
-- I build and test the app
-- I scan code + dependencies + container image
-- I enforce **security gates** (the pipeline fails if risk is too high)
-- I deploy through a GitOps-style flow (Argo CD watches manifests)
+**Jenkins → SonarQube + Dependency-Check + Trivy → Security Gates → GitOps Deploy**
 
-Everything here is written to work with **Jenkins running on Ubuntu inside WSL**.
+## Context
+
+This project shows how I built a **DevSecOps CI/CD pipeline** for a real operations workflow.
+
+The idea is simple: shipping fast is good, but shipping insecure code is dangerous. So instead of only building and deploying an application, I added security checks directly into the pipeline.
+
+In this setup, I:
+
+* build and test the application
+* scan source code for quality and security issues
+* scan dependencies for known CVEs
+* scan the container image for vulnerabilities
+* enforce security gates
+* deploy using a GitOps-style workflow with Argo CD
+
+Everything here was built to work with **Jenkins running on Ubuntu inside WSL**.
 
 ---
 
-## Problem (Real “Ops” Scenario)
+## Problem
 
-In production, deployments move fast — but security problems move faster.
+In a real production environment, teams deploy changes often. The problem is that security issues can easily move with those changes if there are no controls in place.
 
-A common scenario:
-- a “small change” gets merged
-- the build passes
-- but the change introduces:
-  - a vulnerable dependency (CVE)
-  - an insecure code issue / security hotspot
-  - a container image with High/Critical vulnerabilities
+A common ops scenario looks like this:
 
-If we deploy without gates, we risk:
-- a security incident
-- emergency rollback
-- downtime + alerts + “what happened?” calls
+* a developer pushes a small update
+* the build succeeds
+* but the release contains:
 
-So I need a pipeline that:
-- runs the same security checks every time
-- blocks risky releases automatically
-- keeps proof (scan reports + rollout evidence)
+  * a vulnerable package
+  * insecure code
+  * a container image with High or Critical CVEs
+
+If that change reaches production, it can cause:
+
+* security incidents
+* emergency fixes
+* failed deployments
+* downtime
+* late-night troubleshooting
+
+The real problem is not only finding vulnerabilities. The real problem is **stopping risky releases automatically before they reach the cluster**.
 
 ---
 
 ## Solution
 
-I implemented a pipeline with these stages:
+I built a DevSecOps pipeline that adds security checks into the normal CI/CD flow.
 
-1. **Checkout + Unit Tests**
-2. **SonarQube Scan** (code quality + security)
-3. **OWASP Dependency-Check** (dependency CVEs)
-4. **Build Docker image**
-5. **Trivy Image Scan** (container CVEs)
-6. **Security Gates**
-   - fail the pipeline if thresholds are exceeded
-7. **GitOps Deploy**
-   - Jenkins updates the image tag in GitOps manifests
-   - Argo CD syncs and deploys to Kubernetes
-8. **Proof**
-   - reports stored in `reports/`
-   - screenshots stored in `screenshots/`
+The pipeline works like this:
+
+1. Jenkins pulls the code
+2. the application is tested
+3. SonarQube checks code quality and security findings
+4. Dependency-Check scans libraries for known vulnerabilities
+5. Docker builds the container image
+6. Trivy scans the image for High/Critical issues
+7. security gates decide whether the pipeline can continue
+8. Jenkins updates the GitOps deployment manifest
+9. Argo CD detects the change and deploys it to Kubernetes
+
+This approach gives me:
+
+* repeatable scanning
+* automatic blocking of risky releases
+* proof of security checks
+* proof of deployment rollout
+* cleaner and safer release flow
 
 ---
 
-## Architecture Diagram
+## Architecture
 
 ![Architecture Diagram](screenshots/architecture.png)
 
 ---
 
-## Step-by-step CLI 
+## Workflow with goals + screenshots
 
-> Assumptions:
+### 1. Project structure ready
 
-* Jenkins is running on **Ubuntu WSL**
-* Docker available in WSL (Docker Desktop WSL integration or Docker engine)
-* Deploy to Kubernetes (Minikube or any cluster)
+**Goal:** Start with a clean project layout for app code, pipeline logic, Kubernetes manifests, reports, and screenshots.
 
----
-
-### Step 1 — Create the project structure
-
-```bash
-mkdir -p devsecops-cicd-pipeline/{app/src,app/tests,jenkins/scripts,k8s/base,k8s/argocd,gitops/myapp,reports/{trivy,dependency-check,sonar},screenshots}
-cd devsecops-cicd-pipeline
-```
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/01-project-structure.png`
-* What it should show: `tree -L 3` output with folders
-
-```bash
-tree -L 3
-```
-
+  **Should show:** project folders organized for app, Jenkins, Kubernetes, reports, and screenshots.
 
 ![Project structure](screenshots/01-project-structure.png)
 
-
 ---
 
-## SonarQube Setup (WSL + Jenkins)
+### 2. SonarQube running
 
-### Step 2 — Run SonarQube in Docker (WSL)
+**Goal:** Bring up SonarQube so the pipeline can scan source code for code quality, bugs, and security issues.
 
-SonarQube uses Elasticsearch, so set this first:
-
-```bash
-sudo sysctl -w vm.max_map_count=262144
-echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf
-```
-
-Run SonarQube:
-
-```bash
-docker network create devsecops-net >/dev/null 2>&1 || true
-
-docker run -d --name sonarqube \
-  --network devsecops-net \
-  -p 9000:9000 \
-  -e SONAR_ES_BOOTSTRAP_CHECKS_DISABLE=true \
-  sonarqube:community
-```
-
-Verify:
-
-```bash
-curl -s http://localhost:9000/api/system/status
-```
-
-Open UI:
-
-* `http://localhost:9000`
-  Login:
-* `admin / admin` (then change password)
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/02-sonarqube-running.png`
-* What it should show: SonarQube UI loading (login/dashboard)
-
+  **Should show:** SonarQube UI running and accessible.
 
 ![SonarQube running](screenshots/02-sonarqube-running.png)
 
-
 ---
 
-### Step 3 — Create Sonar token
+### 3. Sonar token created
 
-In SonarQube UI:
+**Goal:** Generate an authentication token so Jenkins can connect securely to SonarQube.
 
-* My Account → Security → Generate Token
-* Name: `jenkins-token`
-* Copy it
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/03-sonarqube-token.png`
-* What it should show: token created (don’t expose full token publicly)
-
+  **Should show:** Sonar token created in SonarQube.
 
 ![Sonar token created](screenshots/03-sonarqube-token.png)
 
-
 ---
 
-### Step 4 — Configure SonarQube in Jenkins (WSL)
+### 4. Jenkins connected to SonarQube
 
-Jenkins UI:
+**Goal:** Configure Jenkins to send analysis results to SonarQube during pipeline execution.
 
-* Manage Jenkins → Credentials → (Global) → Add Credentials
-
-  * Kind: Secret text
-  * Secret: (paste Sonar token)
-  * ID: `sonar-token`
-
-Jenkins UI:
-
-* Manage Jenkins → System → SonarQube installations → Add
-
-  * Name: `MySonar`
-  * Server URL: `http://localhost:9000`
-  * Server authentication token: `sonar-token`
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/04-jenkins-sonar-config.png`
-* What it should show: Jenkins SonarQube installation configured 
-
+  **Should show:** SonarQube installation configured inside Jenkins.
 
 ![Jenkins Sonar config](screenshots/04-jenkins-sonar-config.png)
 
-
 ---
 
-### Step 5 — Add SonarQube Scanner tool in Jenkins
+### 5. Sonar scanner tool configured
 
-Jenkins UI:
+**Goal:** Make sure Jenkins has the scanner tool needed to run Sonar analysis jobs.
 
-* Manage Jenkins → Tools → SonarQube Scanner
-
-  * Name: `SonarScanner`
-  * Install automatically ✅
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/05-jenkins-sonar-scanner.png`
-* What it should show: Sonar scanner tool configured
-
+  **Should show:** Sonar scanner tool configured in Jenkins.
 
 ![Sonar scanner tool](screenshots/05-jenkins-sonar-scanner.png)
 
-
 ---
 
-### Step 6 — Add Sonar webhook (Quality Gate support)
+### 6. Sonar webhook added
 
-If Docker engine is in WSL (common with Docker Desktop + WSL2 integration), then Jenkins is reachable via the WSL IP.
+**Goal:** Enable Quality Gate feedback so Jenkins can wait for SonarQube results and fail the pipeline if needed.
 
-Get WSL IP:
-```bash
-hostname -I | awk '{print $1}'
-```
-
-In SonarQube Webhook URL use:
-
-`http://<WSL_IP>:8080/sonarqube-webhook/`
-
-SonarQube UI:
-
-* Administration → Configuration → Webhooks → Create
-
-  * Name: `jenkins-webhook`
-  * URL: `http://<WSL_IP>:8080/sonarqube-webhook/`   or   
-         `http://localhost:8080/sonarqube-webhook/`  
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/06-sonar-webhook.png`
-* What it should show: webhook added in SonarQube
-
+  **Should show:** webhook configured in SonarQube.
 
 ![Sonar webhook](screenshots/06-sonar-webhook.png)
 
-
 ---
 
-## Dependency-Check Setup
+### 7. Dependency-Check report generated
 
-### Step 7 — Run OWASP Dependency-Check (Docker)
+**Goal:** Scan project dependencies and identify known vulnerable libraries before deployment.
 
-* Run Dependency-Check in Jenkinsfile
-Can do it either with:
-
-the Jenkins plugin step, or
-
-the CLI inside the build container/agent
-
-```bash
-mkdir -p .dc-data reports/dependency-check
-
-docker run --rm \
-  -v "$(pwd)/app":/src \
-  -v "$(pwd)/reports/dependency-check":/report \
-  -v "$(pwd)/.dc-data":/usr/share/dependency-check/data \
-  owasp/dependency-check:latest \
-  --scan /src \
-  --format "HTML" \
-  --out /report
-```
-
-* Or Install the plugin 
-
-In Jenkins:
-Manage Jenkins → Plugins → Available
-
-* install OWASP Dependency-Check Plugin
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/07-dependency-check-report.png`
-* What it should show: the HTML report opened OR terminal showing report generated
-![alt text](image.png)
+  **Should show:** generated Dependency-Check report.
 
 ![Dependency-Check report](screenshots/07-dependency-check-report.png)
 
-
 ---
 
-## Trivy Setup
+### 8. Trivy installed and ready
 
-### Step 8 — Install Trivy in WSL
+**Goal:** Prepare container image scanning so the pipeline can detect High/Critical vulnerabilities in Docker images.
 
-```bash
-sudo apt-get update
-sudo apt-get install -y wget gnupg lsb-release
-
-wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | \
-  sudo tee -a /etc/apt/sources.list.d/trivy.list
-
-sudo apt-get update
-sudo apt-get install -y trivy
-trivy --version
-```
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/08-trivy-installed.png`
-* What it should show: `trivy --version`
-
+  **Should show:** Trivy installed successfully.
 
 ![Trivy installed](screenshots/08-trivy-installed.png)
 
-
 ---
 
-## NGINX Setup (Kubernetes Ingress)
+### 9. Ingress controller running
 
-### Step 9 — Start Minikube and enable Ingress-NGINX
+**Goal:** Prepare Kubernetes ingress so the application can be reached through a proper entry point.
 
-```bash
-minikube start
-minikube addons enable ingress
-kubectl get pods -n ingress-nginx
-```
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/09-ingress-controller-running.png`
-* What it should show: ingress controller pod Running
-
+  **Should show:** ingress controller pod running.
 
 ![Ingress controller running](screenshots/09-ingress-controller-running.png)
 
+---
+
+### 10. Application running in Kubernetes
+
+**Goal:** Deploy the baseline application successfully before adding GitOps rollout proof.
+
+**Screenshot used:**
+
+* `screenshots/10-app-running.png`
+  **Should show:** application accessible in the browser.
+
+![App running](screenshots/10-app-running.png)
 
 ---
 
-## Deploy the App (baseline)
+### 11. Service health verified
 
-### Step 10 — Deploy app manifests
+**Goal:** Confirm the application is responding correctly and is healthy.
 
-## Build and push image (manual proof)
-```bash
-docker build -t laly9999/myapp:1 app/
-docker push laly9999/myapp:1
-```
-
-## Apply manifest
-```bash
-kubectl apply -f k8s/base/namespace.yaml
-kubectl apply -n devsecops-demo -f k8s/base/
-kubectl get pods -n devsecops-demo -o wide
-```
-
-# Confirm ingress-nginx controller service
-```bash
-kubectl get svc -n ingress-nginx
-```
-# Port-forward 80 and 443 to your Windows localhost
-```bash
-#kubectl -n ingress-nginx port-forward svc/ingress-nginx-controller 8080:80 8443:443 --address 0.0.0.0
-kubectl -n ingress-nginx port-forward svc/ingress-nginx-controller 8080:80 --address 0.0.0.0
-```
-
-# Update Windows hosts file (point to localhost, not Minikube IP)
-
-In Windows C:\Windows\System32\drivers\etc\hosts, set:
-`notepad C:\Windows\System32\drivers\etc\hosts`
-127.0.0.1  myapp.local
-
-# Update Linux hosts file 
-`sudo vim /etc/hosts`
-127.0.0.1  myapp.local
-
-
-Open your app in Windows browser
-`http://myapp.local:8080`
-
-✅ Screenshot:
-
-* `screenshots/10-pods-ready.png`
-* What it should show: App Running on browser
-
-
-![app running](screenshots/10-app-running.png)
-
-
----
-
-### Step 11 — Verify service health
-
-```bash
-curl -i http://myapp.local:8080/health
-
-```
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/11-service-working.png`
-* What it should show: curl output (200 OK / JSON)
+  **Should show:** successful health check response.
 
 ![Service working](screenshots/11-service-working.png)
 
-
 ---
 
-## Jenkins Pipeline Run (Proof)
+### 12. Jenkins pipeline stages completed
 
-### Step 12 — Run Jenkins pipeline (Build → Scan → Gate)
+**Goal:** Prove the CI/CD pipeline runs through build, scan, and gate stages in Jenkins.
 
-Run Jenkins job connected to this repo.
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/12-jenkins-pipeline-stages.png`
-* What it should show: stages including SonarQube + Dependency-Check + Trivy
-
+  **Should show:** Jenkins stages including SonarQube, Dependency-Check, and Trivy.
 
 ![Jenkins pipeline stages](screenshots/12-jenkins-pipeline-stages.png)
 
-
 ---
 
-## GitOps Deploy Proof (Argo CD)
+### 13. Argo CD application synced
 
-### Step 13 — Create Argo CD Application
+**Goal:** Show the GitOps deployment is working and the cluster state matches Git.
 
-```bash
-
-# -----------------------------
-# 1) Install Argo CD
-# -----------------------------
-kubectl create namespace argocd
-
-kubectl apply -n argocd \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-
-kubectl get pods -n argocd
-kubectl wait -n argocd --for=condition=Ready pod --all --timeout=300s
-
-# -----------------------------
-# 2) Get initial admin password (first-time login)
-# -----------------------------
-# Option A: from secret
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath="{.data.password}" | base64 -d; echo
-
-# Option B: from argocd-server (works even if secret exists)
-kubectl -n argocd exec deploy/argocd-server -- argocd admin initial-password
-
-# -----------------------------
-# 3) Access Argo CD UI (easy way)
-# -----------------------------
-# Keep this running in a terminal while you use the UI:
-kubectl -n argocd port-forward svc/argocd-server 8085:443
-
-# Open in browser:
-# https://localhost:8085
-# user: admin
-# pass: (from Step 2)
-
-
-# 4) Create an Argo CD Application (GitOps)
-# -----------------------------
-REPO_URL="https://github.com/<YOUR_GITHUB>/<YOUR_REPO>.git"
-APP_PATH="gitops/myapp"
-APP_NAME="myapp-devsecops"
-DEST_NS="devsecops-demo"
-
-# Ensure destination namespace exists:
-kubectl create namespace $DEST_NS --dry-run=client -o yaml | kubectl apply -f -
-
-# Create app via CLI:
-argocd app create $APP_NAME \
-  --repo $REPO_URL \
-  --path $APP_PATH \
-  --dest-server https://kubernetes.default.svc \
-  --dest-namespace $DEST_NS
-
-# Turn on auto-sync (optional but recommended):
-argocd app set $APP_NAME --sync-policy automated --auto-prune --self-heal
-
-# Sync now:
-argocd app sync $APP_NAME
-argocd app wait $APP_NAME --health
-
-# Verify in cluster:
-kubectl get all -n $DEST_NS
-kubectl get ingress -n $DEST_NS
-
-
-```
-
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/13-argocd-app-synced.png`
-* What it should show: app is Synced + Healthy
-
+  **Should show:** Argo CD application marked Synced and Healthy.
 
 ![ArgoCD synced](screenshots/13-argocd-app-synced.png)
 
-
 ---
 
-### Step 14 — Rollout proof
+### 14. Rollout completed successfully
 
-```bash
-kubectl rollout status deploy/myapp -n devsecops-demo
-kubectl get pods -n devsecops-demo
-```
+**Goal:** Confirm the deployment rollout finished correctly after GitOps sync.
 
-✅ Screenshot:
+**Screenshot used:**
 
 * `screenshots/14-rollout-status.png`
-* What it should show: rollout succeeded
-
+  **Should show:** successful rollout status.
 
 ![Rollout status](screenshots/14-rollout-status.png)
 
-
-
-
 ---
 
-## Outcome
+## Business Impact
 
-With this setup, I get:
+This project improves release safety in a practical way.
 
-* automated code + dependency + image scanning
-* security gates that stop risky releases
-* reports saved to `reports/`
-* GitOps deployment with Argo CD for consistent cluster state
-* clear proof for portfolio screenshots
+Instead of relying on manual review only, the pipeline enforces security checks automatically before deployment. That reduces the chance of insecure code or vulnerable images reaching production.
+
+From an operations and business point of view, this means:
+
+* fewer risky releases
+* faster detection of security issues
+* less manual verification work
+* more confidence in deployments
+* easier audit proof with reports and screenshots
+* more stable production delivery through GitOps
+
+In short, this pipeline helps turn security into a normal part of delivery instead of a last-minute check.
 
 ---
 
 ## Troubleshooting
 
-### SonarQube not starting (Elasticsearch error)
+### SonarQube not starting
+
+This usually happens because of Elasticsearch memory or kernel setting requirements.
+
+### Jenkins cannot reach SonarQube
+
+This can happen if Jenkins and SonarQube are not using the right network path, especially in WSL or container-based setups.
+
+### Quality Gate does not return to Jenkins
+
+This usually means the SonarQube webhook is missing or incorrect.
+
+### Dependency-Check is slow
+
+The first run often takes longer because vulnerability data has to be downloaded and cached.
+
+### Trivy scan fails
+
+This can happen if the image was not built correctly, the image tag is wrong, or Trivy cannot access the image.
+
+### Ingress returns 404 or 503
+
+This usually means the ingress, service, or backend endpoints are not correctly connected.
+
+### Argo CD app not syncing
+
+This can happen if the Git repo path is wrong, manifests are invalid, or the destination namespace/resources are unhealthy.
+
+### Rollout stuck
+
+This can happen if pods fail readiness checks, image pull fails, or the deployment manifest points to a bad tag.
+
+---
+
+## Useful CLI
+
+### General verification
 
 ```bash
-sudo sysctl -w vm.max_map_count=262144
-docker restart sonarqube
-docker logs -f sonarqube
+docker ps
+kubectl get pods -A
+kubectl get svc -A
+kubectl get ingress -A
 ```
 
-### Jenkins can’t reach SonarQube
-
-From WSL:
+### SonarQube checks
 
 ```bash
 curl -s http://localhost:9000/api/system/status
+docker logs -f sonarqube
 ```
 
-If Jenkins is containerized and Sonar is containerized:
-
-* use `http://sonarqube:9000` (same docker network)
-
-### Quality Gate stage hangs/fails
-
-* Confirm webhook exists in SonarQube:
-
-  * `http://localhost:8080/sonarqube-webhook/`
-
-### Dependency-Check slow
-
-* Keep `.dc-data` cache folder (already in steps)
-* Re-run after first warm-up
-
-### Ingress 404/503
+### Jenkins checks
 
 ```bash
-kubectl describe ingress -n devsecops-demo
-kubectl get endpoints -n devsecops-demo
-kubectl logs -n ingress-nginx deploy/ingress-nginx-controller --tail=80
+docker ps
+curl -I http://localhost:8080
+```
+
+### Dependency-Check report location check
+
+```bash
+ls -R reports/dependency-check
+```
+
+### Trivy checks
+
+```bash
+trivy --version
+trivy image <your-image-name>
+```
+
+### Kubernetes troubleshooting
+
+```bash
+kubectl describe pod <pod-name> -n <namespace>
+kubectl logs <pod-name> -n <namespace>
+kubectl get endpoints -n <namespace>
+kubectl describe svc <service-name> -n <namespace>
+kubectl describe ingress <ingress-name> -n <namespace>
+```
+
+### Argo CD checks
+
+```bash
+kubectl get pods -n argocd
+kubectl logs deploy/argocd-server -n argocd
+kubectl logs deploy/argocd-application-controller -n argocd
+```
+
+### Rollout troubleshooting
+
+```bash
+kubectl rollout status deploy/myapp -n devsecops-demo
+kubectl describe deploy myapp -n devsecops-demo
+kubectl get rs -n devsecops-demo
+kubectl get pods -n devsecops-demo -o wide
+```
+
+### Image troubleshooting
+
+```bash
+docker images
+kubectl describe pod <pod-name> -n <namespace>
 ```
 
 ---
 
-## Next Improvements (Optional)
+## Cleanup
 
-* SBOM generation (Syft) + image signing (Cosign)
-* secret scanning (Gitleaks)
-* policy gates (OPA Conftest / Kyverno)
-* Slack alerts on gate failures
-* promote images across dev → staging → prod with approvals
+```bash
+kubectl delete namespace devsecops-demo --ignore-not-found
+kubectl delete namespace argocd --ignore-not-found
+docker rm -f sonarqube || true
+docker network rm devsecops-net || true
+minikube stop
+```
 
+---
 
